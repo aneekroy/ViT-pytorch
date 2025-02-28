@@ -14,8 +14,9 @@ import torch.distributed as dist
 
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
-from apex import amp
-from apex.parallel import DistributedDataParallel as DDP
+
+# from apex import amp
+# from apex.parallel import DistributedDataParallel as DDP
 
 from models.modeling import VisionTransformer, CONFIGS
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
@@ -59,7 +60,22 @@ def setup(args):
     # Prepare model
     config = CONFIGS[args.model_type]
 
-    num_classes = 10 if args.dataset == "cifar10" else 100
+    if args.dataset == "cifar10":
+        num_classes = 10
+    elif args.dataset == "cifar100":
+        num_classes = 100
+    elif args.dataset == "ants_bees":
+        num_classes = 2
+    else:
+        num_classes = args.num_classes
+
+    # Check if MPS (Metal Performance Shaders) is available for Mac
+    if torch.backends.mps.is_available():
+        args.device = torch.device("mps")
+    elif torch.cuda.is_available():
+        args.device = torch.device("cuda")
+    else:
+        args.device = torch.device("cpu")
 
     model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes)
     model.load_from(np.load(args.pretrained_dir))
@@ -160,57 +176,77 @@ def train(args, model):
     else:
         scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
 
-    if args.fp16:
-        model, optimizer = amp.initialize(models=model,
-                                          optimizers=optimizer,
-                                          opt_level=args.fp16_opt_level)
-        amp._amp_state.loss_scalers[0]._loss_scale = 2**20
-
     # Distributed training
     if args.local_rank != -1:
-        model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
+        try:
+            from apex.parallel import DistributedDataParallel as DDP
+            model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
+        except ImportError:
+            from torch.nn.parallel import DistributedDataParallel as DDP
+            model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
+
+    # Mixed precision training
+    if args.fp16:
+        try:
+            from apex import amp
+            model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
+            scaler = None
+        except ImportError:
+            logger.info("apex not installed, using native amp")
+            scaler = torch.cuda.amp.GradScaler()
+    else:
+        scaler = None
 
     # Train!
     logger.info("***** Running training *****")
     logger.info("  Total optimization steps = %d", args.num_steps)
     logger.info("  Instantaneous batch size per GPU = %d", args.train_batch_size)
-    logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
+    logger.info("  Total train batch size = %d",
                 args.train_batch_size * args.gradient_accumulation_steps * (
                     torch.distributed.get_world_size() if args.local_rank != -1 else 1))
     logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
 
     model.zero_grad()
-    set_seed(args)  # Added here for reproducibility (even between python 2 and 3)
+    set_seed(args)  # Added here for reproducibility
     losses = AverageMeter()
     global_step, best_acc = 0, 0
+    
     while True:
         model.train()
         epoch_iterator = tqdm(train_loader,
-                              desc="Training (X / X Steps) (loss=X.X)",
-                              bar_format="{l_bar}{r_bar}",
-                              dynamic_ncols=True,
-                              disable=args.local_rank not in [-1, 0])
+                            desc="Training (X / X Steps) (loss=X.X)",
+                            bar_format="{l_bar}{r_bar}",
+                            dynamic_ncols=True,
+                            disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
             batch = tuple(t.to(args.device) for t in batch)
             x, y = batch
-            loss = model(x, y)
 
+            # Forward pass
+            if args.fp16 and scaler is not None:
+                with torch.cuda.amp.autocast():
+                    loss = model(x, y)
+            else:
+                loss = model(x, y)
+
+            # Backward pass
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
-            if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
+
+            if args.fp16 and scaler is not None:
+                scaler.scale(loss).backward()
             else:
                 loss.backward()
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
-                losses.update(loss.item()*args.gradient_accumulation_steps)
-                if args.fp16:
-                    torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+                # Update weights
+                if args.fp16 and scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    optimizer.step()
+
                 scheduler.step()
-                optimizer.step()
                 optimizer.zero_grad()
                 global_step += 1
 
@@ -244,8 +280,9 @@ def main():
     # Required parameters
     parser.add_argument("--name", required=True,
                         help="Name of this run. Used for monitoring.")
-    parser.add_argument("--dataset", choices=["cifar10", "cifar100"], default="cifar10",
-                        help="Which downstream task.")
+    parser.add_argument("--dataset", choices=["cifar10", "cifar100", "ants_bees"], 
+                        default="cifar10",
+                        help="Which dataset to use")
     parser.add_argument("--model_type", choices=["ViT-B_16", "ViT-B_32", "ViT-L_16",
                                                  "ViT-L_32", "ViT-H_14", "R50-ViT-B_16"],
                         default="ViT-B_16",
@@ -293,6 +330,8 @@ def main():
                         help="Loss scaling to improve fp16 numeric stability. Only used when fp16 set to True.\n"
                              "0 (default value): dynamic loss scaling.\n"
                              "Positive power of 2: static loss scaling value.\n")
+    parser.add_argument("--num_classes", type=int, default=2,
+                        help="Number of classes in the dataset")
     args = parser.parse_args()
 
     # Setup CUDA, GPU & distributed training
