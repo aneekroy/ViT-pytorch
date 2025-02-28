@@ -15,6 +15,9 @@ def get_loader(args):
 
     transform_train = transforms.Compose([
         transforms.RandomResizedCrop((args.img_size, args.img_size), scale=(0.05, 1.0)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4),
+        transforms.RandomRotation(15),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
@@ -24,7 +27,12 @@ def get_loader(args):
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
 
-    if args.dataset == "cifar10":
+    if args.dataset == "ants_bees":
+        trainset = datasets.ImageFolder(root="./train",
+                                      transform=transform_train)
+        testset = datasets.ImageFolder(root="./val",
+                                     transform=transform_test) if args.local_rank in [-1, 0] else None
+    elif args.dataset == "cifar10":
         trainset = datasets.CIFAR10(root="./data",
                                     train=True,
                                     download=True,
@@ -33,7 +41,6 @@ def get_loader(args):
                                    train=False,
                                    download=True,
                                    transform=transform_test) if args.local_rank in [-1, 0] else None
-
     else:
         trainset = datasets.CIFAR100(root="./data",
                                      train=True,
